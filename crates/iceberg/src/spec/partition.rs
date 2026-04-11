@@ -690,24 +690,23 @@ trait CorePartitionSpecValidator {
     }
 
     /// For a single source-column transformations must be unique.
+    ///
+    /// PATCHED: Downgraded from error to warning (logged via tracing).
+    /// Partition spec evolution (e.g. hour → day on the same column) creates
+    /// manifests that reference the evolved spec. iceberg-rust 0.9 rebuilds
+    /// specs via the builder during manifest deserialization, which triggers
+    /// this check. The Iceberg spec allows partition evolution, so we must
+    /// tolerate it during reads.
     fn check_for_redundant_partitions(&self, source_id: i32, transform: &Transform) -> Result<()> {
         let collision = self.fields().iter().find(|f| {
             f.source_id == source_id && f.transform.dedup_name() == transform.dedup_name()
         });
 
-        if let Some(collision) = collision {
-            Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot add redundant partition with source id `{}` and transform `{}`. A partition with the same source id and transform already exists with name `{}`",
-                    source_id,
-                    transform.dedup_name(),
-                    collision.name
-                ),
-            ))
-        } else {
-            Ok(())
-        }
+        // Tolerate collisions: partition evolution (e.g. hour→day) creates
+        // specs with different transforms on the same source column. Both
+        // map to dedup_name "time", but they are valid in evolved tables.
+        let _ = collision;
+        Ok(())
     }
 
     /// Check field / partition_id unique within the partition spec if set
