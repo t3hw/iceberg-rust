@@ -17,7 +17,7 @@
 
 //! Parquet file data reader
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -58,7 +58,7 @@ use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{DataContentType, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -399,12 +399,41 @@ impl ArrowReader {
             .copied()
             .collect();
 
-        // Create projection mask based on field IDs
-        // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
-        // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
-        // - If fallback IDs: position-based projection (missing_field_ids=true)
+        // Collect equality delete key field IDs from the task's delete files.
+        // These may reference columns NOT in the user's projection. We must
+        // include them in the Parquet read so equality deletes can be applied,
+        // then strip them from the output batches afterward.
+        let eq_delete_key_field_ids: BTreeSet<i32> = task
+            .deletes
+            .iter()
+            .filter(|d| matches!(d.file_type, DataContentType::EqualityDeletes))
+            .filter_map(|d| d.equality_ids.as_ref())
+            .flatten()
+            .copied()
+            .collect();
+
+        // Augment the Parquet projection with any equality delete key columns
+        // that the user didn't request. Guard: when the user's projection is
+        // empty, ProjectionMask::all() reads all columns — no augmentation needed.
+        let augmented_field_ids: Vec<i32> = if !eq_delete_key_field_ids.is_empty()
+            && !project_field_ids_without_metadata.is_empty()
+        {
+            let user_set: HashSet<i32> =
+                project_field_ids_without_metadata.iter().copied().collect();
+            let mut augmented = project_field_ids_without_metadata.clone();
+            for &id in &eq_delete_key_field_ids {
+                if !user_set.contains(&id) && !is_metadata_field(id) {
+                    augmented.push(id);
+                }
+            }
+            augmented
+        } else {
+            project_field_ids_without_metadata.clone()
+        };
+
+        // Create projection mask based on field IDs (augmented with eq delete keys)
         let projection_mask = Self::get_arrow_projection_mask(
-            &project_field_ids_without_metadata,
+            &augmented_field_ids,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
@@ -416,9 +445,25 @@ impl ArrowReader {
 
         // RecordBatchTransformer performs any transformations required on the RecordBatches
         // that come back from the file, such as type promotion, default column insertion,
-        // column re-ordering, partition constants, and virtual field addition (like _file)
+        // column re-ordering, partition constants, and virtual field addition (like _file).
+        // When equality delete key columns were added to the projection, the transformer
+        // must also know about them so it can apply type promotion correctly.
+        let transformer_field_ids: Vec<i32> =
+            if !eq_delete_key_field_ids.is_empty() && !task.project_field_ids.is_empty() {
+                let user_set: HashSet<i32> = task.project_field_ids.iter().copied().collect();
+                let mut ids = task.project_field_ids.to_vec();
+                for &id in &eq_delete_key_field_ids {
+                    if !user_set.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            } else {
+                task.project_field_ids.to_vec()
+            };
+
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), &transformer_field_ids);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -568,17 +613,42 @@ impl ArrowReader {
         // lookups. This runs after decompression and the record batch transformer,
         // checking each row against each delete set in O(1) per row.
         // Multiple sets occur only when delete files use different equality_ids.
-        if eq_delete_sets.is_empty() {
-            Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+        //
+        // If we augmented the projection with equality delete key columns that
+        // the user didn't request, strip those extra columns after applying
+        // deletes so the output schema matches the user's original projection.
+        let extra_eq_cols_to_strip = if !eq_delete_key_field_ids.is_empty()
+            && !task.project_field_ids.is_empty()
+            && eq_delete_key_field_ids
+                .iter()
+                .any(|id| !task.project_field_ids.contains(id))
+        {
+            task.project_field_ids.len()
         } else {
-            let filtered_stream = record_batch_stream.map(move |batch_result| {
+            0
+        };
+
+        if eq_delete_sets.is_empty() {
+            if extra_eq_cols_to_strip > 0 {
+                let stripped = record_batch_stream.map(move |batch_result| {
+                    Self::strip_extra_columns(batch_result?, extra_eq_cols_to_strip)
+                });
+                Ok(Box::pin(stripped) as ArrowRecordBatchStream)
+            } else {
+                Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+            }
+        } else {
+            let filtered = record_batch_stream.map(move |batch_result| {
                 let mut batch = batch_result?;
                 for eq_delete_set in &eq_delete_sets {
                     batch = Self::apply_eq_delete_filter(&batch, eq_delete_set)?;
                 }
+                if extra_eq_cols_to_strip > 0 {
+                    batch = Self::strip_extra_columns(batch, extra_eq_cols_to_strip)?;
+                }
                 Ok(batch)
             });
-            Ok(Box::pin(filtered_stream) as ArrowRecordBatchStream)
+            Ok(Box::pin(filtered) as ArrowRecordBatchStream)
         }
     }
 
@@ -668,6 +738,21 @@ impl ArrowReader {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("Failed to filter record batch: {e}"),
+            )
+        })
+    }
+
+    /// Strips columns beyond `num_cols_to_keep` from the batch.
+    ///
+    /// Used to remove equality delete key columns that were added to the
+    /// projection solely for delete evaluation. The extra columns are always
+    /// appended at the end by the augmentation logic in `process_file_scan_task`.
+    fn strip_extra_columns(batch: RecordBatch, num_cols_to_keep: usize) -> Result<RecordBatch> {
+        let indices: Vec<usize> = (0..num_cols_to_keep).collect();
+        batch.project(&indices).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("stripping eq delete key columns: {e}"),
             )
         })
     }
@@ -4757,5 +4842,360 @@ message schema {
         assert_eq!(result[0], expected_0);
         assert_eq!(result[1], expected_1);
         assert_eq!(result[2], expected_2);
+    }
+
+    // =========================================================================
+    // Equality delete + column projection tests
+    //
+    // Verify that equality deletes work correctly when the user's column
+    // projection does not include the equality delete key columns.
+    // =========================================================================
+
+    /// Helper: create a 3-column data file and an equality delete Parquet file.
+    ///
+    /// Data: 5 rows — id(1..=5), name(a..e), value(10,20,30,40,50).
+    /// Delete file schema uses the caller-provided Arrow schema + batches.
+    fn create_eq_delete_test_fixtures(
+        table_location: &str,
+        delete_batches: Vec<RecordBatch>,
+    ) -> (String, String, SchemaRef) {
+        use arrow_array::Int32Array;
+
+        let table_schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::required(3, "value", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let data_arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+            Field::new("value", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "3".to_string(),
+            )])),
+        ]));
+
+        let data_file_path = format!("{table_location}/data.parquet");
+        let data_batch = RecordBatch::try_new(data_arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+        ])
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(&data_file_path).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(file, data_arrow_schema.clone(), Some(props)).unwrap();
+        writer.write(&data_batch).unwrap();
+        writer.close().unwrap();
+
+        let delete_file_path = format!("{table_location}/eq_deletes.parquet");
+        let delete_schema = delete_batches[0].schema();
+        let delete_props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let delete_file = File::create(&delete_file_path).unwrap();
+        let mut delete_writer =
+            ArrowWriter::try_new(delete_file, delete_schema, Some(delete_props)).unwrap();
+        for batch in &delete_batches {
+            delete_writer.write(batch).unwrap();
+        }
+        delete_writer.close().unwrap();
+
+        (data_file_path, delete_file_path, table_schema)
+    }
+
+    /// Helper: build a single-column delete batch for field "id" (field_id=1).
+    fn eq_delete_batch_for_id(ids: Vec<i32>) -> RecordBatch {
+        use arrow_array::Int32Array;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    /// Test A: Projected scan EXCLUDES the equality delete key column.
+    #[tokio::test]
+    async fn test_eq_delete_projection_excludes_delete_key() {
+        let tmp_dir = TempDir::new().unwrap();
+        let loc = tmp_dir.path().to_str().unwrap().to_string();
+
+        let (data_path, del_path, schema) =
+            create_eq_delete_test_fixtures(&loc, vec![eq_delete_batch_for_id(vec![3])]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(5),
+            data_file_path: data_path,
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: vec![2, 3], // name, value — NOT id
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+                file_path: del_path,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "Expected 4 rows after deleting id=3");
+
+        let out_schema = result[0].schema();
+        let col_names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            col_names,
+            vec!["name", "value"],
+            "Output must only contain projected columns"
+        );
+
+        let names: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec!["a", "b", "d", "e"]);
+    }
+
+    /// Test B: Projected scan INCLUDES the equality delete key column.
+    #[tokio::test]
+    async fn test_eq_delete_projection_includes_delete_key() {
+        use arrow_array::Int32Array;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let loc = tmp_dir.path().to_str().unwrap().to_string();
+
+        let (data_path, del_path, schema) =
+            create_eq_delete_test_fixtures(&loc, vec![eq_delete_batch_for_id(vec![3])]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(5),
+            data_file_path: data_path,
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: vec![1, 2, 3], // id, name, value — includes delete key
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+                file_path: del_path,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4);
+
+        let out_schema = result[0].schema();
+        let col_names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(col_names, vec!["id", "name", "value"]);
+
+        let ids: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 4, 5]);
+    }
+
+    /// Test C: Full scan (all fields projected) with equality deletes.
+    #[tokio::test]
+    async fn test_eq_delete_full_scan_no_projection() {
+        let tmp_dir = TempDir::new().unwrap();
+        let loc = tmp_dir.path().to_str().unwrap().to_string();
+
+        let (data_path, del_path, schema) =
+            create_eq_delete_test_fixtures(&loc, vec![eq_delete_batch_for_id(vec![3])]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(5),
+            data_file_path: data_path,
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: vec![1, 2, 3],
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+                file_path: del_path,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1]),
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4);
+
+        let out_schema = result[0].schema();
+        let col_names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(col_names, vec!["id", "name", "value"]);
+    }
+
+    /// Test D: Multi-field equality delete, NEITHER key in projection.
+    #[tokio::test]
+    async fn test_eq_delete_multi_field_key_excluded_from_projection() {
+        use arrow_array::Int32Array;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let loc = tmp_dir.path().to_str().unwrap().to_string();
+
+        // Delete keyed on BOTH id(1) AND name(2)
+        let del_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let del_batch = RecordBatch::try_new(del_schema, vec![
+            Arc::new(Int32Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["c"])),
+        ])
+        .unwrap();
+
+        let (data_path, del_path, schema) = create_eq_delete_test_fixtures(&loc, vec![del_batch]);
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(5),
+            data_file_path: data_path,
+            data_file_format: DataFileFormat::Parquet,
+            schema,
+            project_field_ids: vec![3], // only value — neither delete key
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+                file_path: del_path,
+                file_type: DataContentType::EqualityDeletes,
+                partition_spec_id: 0,
+                equality_ids: Some(vec![1, 2]),
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result: Vec<RecordBatch> = reader.read(tasks).unwrap().try_collect().await.unwrap();
+
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4, "Expected 4 rows after deleting id=3,name=c");
+
+        let out_schema = result[0].schema();
+        let col_names: Vec<&str> = out_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            col_names,
+            vec!["value"],
+            "Output must only contain projected columns"
+        );
+
+        let values: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![10, 20, 40, 50]);
     }
 }
