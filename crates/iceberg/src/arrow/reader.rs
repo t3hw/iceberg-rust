@@ -29,6 +29,7 @@ use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
     ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
+use arrow_select::filter::filter_record_batch;
 use arrow_string::like::starts_with;
 use bytes::Bytes;
 use fnv::FnvHashSet;
@@ -46,9 +47,9 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use typed_builder::TypedBuilder;
 
-use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::caching_delete_file_loader::{CachingDeleteFileLoader, EqDeleteKey, EqDeleteSet};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
-use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
+use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
@@ -528,36 +529,21 @@ impl ArrowReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let eq_delete_sets = delete_filter.build_equality_delete_sets(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
+        // The scan predicate (if any) is applied via the Parquet RowFilter.
+        // Equality deletes are applied as a separate post-read filter step using
+        // a HashSet for O(1) per-row lookups instead of O(N) predicate evaluation.
+        let final_predicate = task.predicate.clone();
 
-        // There are three possible sources for potential lists of selected RowGroup indices,
-        // and two for `RowSelection`s.
-        // Selected RowGroup index lists can come from three sources:
+        // Selected RowGroup index lists can come from two sources:
         //   * When task.start and task.length specify a byte range (file splitting);
-        //   * When there are equality delete files that are applicable;
         //   * When there is a scan predicate and row_group_filtering_enabled = true.
         // `RowSelection`s can be created in either or both of the following cases:
         //   * When there are positional delete files that are applicable;
         //   * When there is a scan predicate and row_selection_enabled = true
-        // Note that row group filtering from predicates only happens when
-        // there is a scan predicate AND row_group_filtering_enabled = true,
-        // but we perform row selection filtering if there are applicable
-        // equality delete files OR (there is a scan predicate AND row_selection_enabled),
-        // since the only implemented method of applying positional deletes is
-        // by using a `RowSelection`.
+        // Equality deletes are applied as a post-read hash-based filter (not via
+        // RowFilter or RowSelection) for O(1) per-row lookups.
         let mut selected_row_group_indices = None;
         let mut row_selection = None;
 
@@ -666,7 +652,112 @@ impl ArrowReader {
                     Err(err) => Err(err.into()),
                 });
 
-        Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+        // Apply equality delete filtering as a post-read step using hash-based
+        // lookups. This runs after decompression and the record batch transformer,
+        // checking each row against each delete set in O(1) per row.
+        // Multiple sets occur only when delete files use different equality_ids.
+        if eq_delete_sets.is_empty() {
+            Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
+        } else {
+            let filtered_stream = record_batch_stream.map(move |batch_result| {
+                let mut batch = batch_result?;
+                for eq_delete_set in &eq_delete_sets {
+                    batch = Self::apply_eq_delete_filter(&batch, eq_delete_set)?;
+                }
+                Ok(batch)
+            });
+            Ok(Box::pin(filtered_stream) as ArrowRecordBatchStream)
+        }
+    }
+
+    /// Filters a record batch by removing rows whose equality-delete key columns
+    /// match an entry in the delete set. Uses O(1) hash lookups per row.
+    fn apply_eq_delete_filter(
+        batch: &RecordBatch,
+        delete_set: &EqDeleteSet,
+    ) -> Result<RecordBatch> {
+        // Locate delete key columns in the batch by field_id (stored in Arrow
+        // field metadata under the "PARQUET:field_id" key).
+        // For each delete key field, locate the corresponding column in the batch
+        // and convert it to a Vec<Option<Datum>> for hash-based lookups.
+        let datum_columns: Vec<Vec<Option<Datum>>> = delete_set
+            .fields
+            .iter()
+            .map(|(field_name, field_id)| {
+                // Find the column by field_id in the batch schema metadata,
+                // falling back to name-based lookup.
+                let col = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(col_idx, field)| {
+                        let id = field
+                            .metadata()
+                            .get(PARQUET_FIELD_ID_META_KEY)?
+                            .parse::<i32>()
+                            .ok()?;
+                        (id == *field_id).then(|| batch.column(col_idx))
+                    })
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        batch.schema().index_of(field_name).map(|idx| batch.column(idx)).map_err(|_| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "Equality delete key column '{}' (field_id={}) not found in batch",
+                                    field_name, field_id
+                                ),
+                            )
+                        })
+                    })?;
+                // Resolve the Iceberg PrimitiveType from the Arrow data type.
+                let iceberg_type =
+                    crate::arrow::arrow_type_to_type(col.data_type())?;
+                let literals = arrow_primitive_to_literal(col, &iceberg_type)?;
+                // Convert Literal → Datum
+                let primitive_type = iceberg_type
+                    .as_primitive_type()
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::Unexpected, "field is not a primitive type")
+                    })?
+                    .clone();
+                let datums = literals
+                    .into_iter()
+                    .map(|opt_lit| {
+                        opt_lit
+                            .and_then(|lit| lit.as_primitive_literal())
+                            .map(|prim_lit| Datum::new(primitive_type.clone(), prim_lit))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(datums)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let num_rows = batch.num_rows();
+        let num_cols = datum_columns.len();
+        let mut keep = vec![true; num_rows];
+
+        // Reuse a single EqDeleteKey allocation across all rows to avoid
+        // per-row Vec allocation + clone. We swap in new values each iteration.
+        let mut probe_key = EqDeleteKey(vec![None; num_cols]);
+
+        for row_idx in 0..num_rows {
+            for (col_idx, col) in datum_columns.iter().enumerate() {
+                probe_key.0[col_idx].clone_from(&col[row_idx]);
+            }
+            if delete_set.keys.contains(&probe_key) {
+                keep[row_idx] = false;
+            }
+        }
+
+        let mask = BooleanArray::from(keep);
+        filter_record_batch(batch, &mask).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to filter record batch: {e}"),
+            )
+        })
     }
 
     /// Opens a Parquet file and loads its metadata, returning both the reader and metadata.
