@@ -98,7 +98,5 @@ pub mod writer;
 mod delete_vector;
 pub mod metadata_columns;
 pub mod puffin;
-/// Utilities for traversing snapshot history.
-pub mod snapshot;
 /// Utility functions and modules.
 pub mod util;
